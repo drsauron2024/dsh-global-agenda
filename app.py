@@ -34,6 +34,7 @@ ACCENT = "#5d9cff"
 ACCENT_HOVER = "#78adff"
 ON_ACCENT = "#07111f"
 SUCCESS = "#46d39b"
+WARNING = "#f0b35b"
 DANGER = "#ff7182"
 DANGER_HOVER = "#ff8d9b"
 INPUT_BG = "#090f17"
@@ -1202,9 +1203,11 @@ class AgendaApp:
 
     def _draw_pill_status(self) -> None:
         self.pill_live_dot.delete("all")
-        if self._latest_snapshot and self._latest_snapshot.sessions:
-            color = SUCCESS
-            self.pill_live_label.configure(text=str(len(self._latest_snapshot.sessions)), fg=SUCCESS)
+        sessions = self._latest_snapshot.sessions if self._latest_snapshot else ()
+        waiting = sum(1 for task in sessions if task.needs_attention)
+        if sessions:
+            color = WARNING if waiting else SUCCESS
+            self.pill_live_label.configure(text=str(len(sessions)), fg=color)
             self.pill_live.pack(side="right", padx=(0, self.px(4)))
         else:
             color = DIM
@@ -1234,6 +1237,7 @@ class AgendaApp:
                         task.turn,
                         task.step,
                         int(max(0.0, now_ms - task.started_at) / 5000) if task.started_at else 0,
+                        task.needs_attention,
                     )
                     for task in snapshot.sessions
                 ),
@@ -1259,6 +1263,7 @@ class AgendaApp:
             child.destroy()
 
         sessions = snapshot.sessions
+        waiting = [task for task in sessions if task.needs_attention]
         process_running = bool(snapshot.process_running)
         window_present = bool(snapshot.window_present)
         error = snapshot.error
@@ -1274,9 +1279,14 @@ class AgendaApp:
             dot_color = DIM
             note = "DeepSeek Harness 未启动"
         elif sessions:
-            summary = f"{len(sessions)} 个运行中"
-            summary_color = SUCCESS
-            dot_color = SUCCESS
+            if waiting:
+                summary = f"{len(waiting)} 个待授权"
+                summary_color = WARNING
+                dot_color = WARNING
+            else:
+                summary = f"{len(sessions)} 个运行中"
+                summary_color = SUCCESS
+                dot_color = SUCCESS
             note = ""
         else:
             summary = "空闲"
@@ -1292,10 +1302,11 @@ class AgendaApp:
             self.open_harness_btn.configure(state="disabled")
 
         if sessions:
+            ordered = sorted(sessions, key=lambda task: (not task.needs_attention, -task.last_event_at))
             max_rows = 3
-            for task in sessions[:max_rows]:
+            for task in ordered[:max_rows]:
                 self._build_running_row(task, now_ms, window_present)
-            remaining = len(sessions) - max_rows
+            remaining = len(ordered) - max_rows
             if remaining > 0:
                 more = tk.Label(
                     self.running_box,
@@ -1326,6 +1337,25 @@ class AgendaApp:
         inner.pack(fill="x")
         top = tk.Frame(inner, bg=CARD)
         top.pack(fill="x")
+        needs_attention = bool(task.needs_attention)
+        row_dot = tk.Canvas(
+            top,
+            width=self.px(7),
+            height=self.px(7),
+            bg=CARD,
+            highlightthickness=0,
+            bd=0,
+        )
+        row_dot.pack(side="left", padx=(0, self.px(6)), pady=(self.px(4), 0))
+        dot_size = self.px(7)
+        row_dot.create_oval(
+            0,
+            0,
+            dot_size,
+            dot_size,
+            fill=WARNING if needs_attention else SUCCESS,
+            outline="",
+        )
         title = tk.Label(
             top,
             text=ellipsize(task.title or task.session_id, 20),
@@ -1351,8 +1381,8 @@ class AgendaApp:
             detail,
             text=task.activity,
             bg=CARD,
-            fg=MUTED,
-            font=self.f_tiny,
+            fg=WARNING if needs_attention else MUTED,
+            font=self.f_tiny_bold if needs_attention else self.f_tiny,
             anchor="w",
             bd=0,
         )
@@ -1367,7 +1397,7 @@ class AgendaApp:
             bd=0,
         )
         step.pack(side="right")
-        children = [row, inner, top, title, elapsed, detail, activity, step]
+        children = [row, inner, top, row_dot, title, elapsed, detail, activity, step]
         if window_present:
             for widget in children:
                 widget.bind("<Button-1>", lambda _event: self.focus_harness())

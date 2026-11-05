@@ -45,6 +45,7 @@ class RunningTask:
     step: int
     started_at: float
     last_event_at: float
+    needs_attention: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +68,7 @@ class _ParsedSession:
     last_event_at: float
     last_event_type: str
     open_tools: tuple[str, ...]
+    approval_pending: bool
 
 
 def _kernel32():
@@ -234,7 +236,7 @@ def _friendly_tool(name: str) -> str:
 
 
 def _activity(parsed: _ParsedSession, now_ms: float) -> str:
-    if parsed.last_event_type == "approval/asked":
+    if parsed.approval_pending:
         return "等待批准"
     if parsed.open_tools:
         names = parsed.open_tools
@@ -356,6 +358,7 @@ class DshMonitor:
         last_event_at = 0.0
         last_event_type = ""
         open_tools: dict[str, str] = {}
+        approval_pending = False
 
         for raw_line in data.splitlines():
             if not raw_line.strip():
@@ -405,9 +408,15 @@ class DshMonitor:
                 step = 0
                 started_at = when
                 open_tools.clear()
+                approval_pending = False
             elif kind == "turn/end":
                 running = False
                 open_tools.clear()
+                approval_pending = False
+            elif kind == "approval/asked":
+                approval_pending = True
+            elif kind == "approval/decided":
+                approval_pending = False
             elif kind == "step/start":
                 if isinstance(payload, dict) and isinstance(payload.get("step"), int):
                     step = payload["step"]
@@ -450,6 +459,7 @@ class DshMonitor:
             last_event_at=last_event_at,
             last_event_type=last_event_type,
             open_tools=tuple(open_tools.values()),
+            approval_pending=approval_pending,
         )
         self._cache[str(path)] = (signature, parsed)
         return parsed
@@ -481,6 +491,7 @@ class DshMonitor:
                         step=parsed.step,
                         started_at=parsed.started_at,
                         last_event_at=parsed.last_event_at,
+                        needs_attention=parsed.approval_pending,
                     )
                 )
             sessions.sort(key=lambda item: item.last_event_at, reverse=True)
