@@ -257,6 +257,9 @@ class AgendaApp:
         self.editing_task_id: Optional[str] = None
         self._edit_due: Optional[date] = None
         self._edit_previous: Optional[dict] = None
+        self.search_open = False
+        self.search_query = ""
+        self._search_after_id: Optional[str] = None
 
         self._drag_origin: Optional[tuple[int, int]] = None
         self._pill_press_pos: Optional[tuple[int, int]] = None
@@ -285,6 +288,7 @@ class AgendaApp:
         self.root.bind("<Escape>", self._on_escape)
         self.root.bind("<Control-q>", lambda _event: self.close())
         self.root.bind("<Control-n>", self._focus_entry)
+        self.root.bind("<Control-f>", self._focus_search)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     # ------------------------------------------------------------------ setup
@@ -716,6 +720,71 @@ class AgendaApp:
             padx=self.px(4),
             pady=0,
         )
+        self.search_btn = self._flat_button(
+            self.view_bar,
+            "搜索",
+            self._open_search,
+            font=self.f_tiny,
+            fg=MUTED,
+            hover_fg=TEXT,
+            bg=BG,
+            hover_bg=CARD_HOVER,
+            padx=self.px(4),
+            pady=0,
+        )
+        self.search_btn.pack(side="right")
+        self.search_inner = tk.Frame(self.view_bar, bg=BG)
+        self.search_border = tk.Frame(self.search_inner, bg=BORDER)
+        self.search_border.pack(side="left", fill="x", expand=True)
+        tk.Label(
+            self.search_border,
+            text="搜索",
+            bg=INPUT_BG,
+            fg=MUTED,
+            font=self.f_tiny,
+            bd=0,
+        ).pack(side="left", padx=(self.px(6), self.px(4)))
+        self.search_var = tk.StringVar()
+        self.search_entry = tk.Entry(
+            self.search_border,
+            textvariable=self.search_var,
+            font=self.f_small,
+            fg=TEXT,
+            bg=INPUT_BG,
+            insertbackground=TEXT,
+            selectbackground=ACCENT,
+            selectforeground=ON_ACCENT,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        self.search_entry.pack(side="left", fill="x", expand=True, padx=(0, self.px(4)), pady=self.px(4))
+        self.search_count = tk.Label(
+            self.search_inner,
+            text="",
+            bg=BG,
+            fg=MUTED,
+            font=self.f_tiny_bold,
+            bd=0,
+        )
+        self.search_count.pack(side="left", padx=(self.px(6), 0))
+        self.search_close = self._flat_button(
+            self.search_inner,
+            "×",
+            self._close_search,
+            font=self.f_small,
+            fg=MUTED,
+            hover_fg=DANGER,
+            bg=BG,
+            hover_bg=CARD_HOVER,
+            padx=self.px(4),
+            pady=0,
+        )
+        self.search_close.pack(side="left")
+        self.search_var.trace_add("write", lambda *_args: self._on_search_change())
+        self.search_entry.bind("<Escape>", self._on_search_escape)
+        self.search_entry.bind("<FocusIn>", lambda _event: self.search_border.configure(bg=ACCENT))
+        self.search_entry.bind("<FocusOut>", lambda _event: self.search_border.configure(bg=BORDER))
         self.view_bar.pack(fill="x", pady=(self.px(5), 0))
 
         self.list_wrap = tk.Frame(self.content_wrap, bg=BG)
@@ -1153,6 +1222,80 @@ class AgendaApp:
         self._refresh_task_ui(scroll_top=True)
         self.entry.focus_set()
 
+    def _search_matches(self) -> list[dict]:
+        query = self.search_query.strip().casefold()
+        if not query:
+            return self.tasks
+        return [task for task in self.tasks if query in (task.get("text") or "").casefold()]
+
+    def _on_search_change(self) -> None:
+        if not self.search_open:
+            return
+        self.search_query = self.search_var.get()
+        if self._search_after_id is not None:
+            try:
+                self.root.after_cancel(self._search_after_id)
+            except tk.TclError:
+                pass
+        self._search_after_id = self.root.after(120, self._apply_search)
+
+    def _apply_search(self) -> None:
+        self._search_after_id = None
+        if self.search_open:
+            self._refresh_task_ui(scroll_top=True)
+
+    def _on_search_escape(self, _event=None) -> str:
+        self._close_search()
+        self.entry.focus_set()
+        return "break"
+
+    def _focus_search(self, _event=None) -> str:
+        if self.collapsed:
+            self.expand()
+        if self.search_open:
+            self.search_entry.focus_set()
+        else:
+            self._open_search()
+        return "break"
+
+    def _open_search(self) -> None:
+        if self.search_open:
+            self.search_entry.focus_set()
+            return
+        if self.calendar_open:
+            self._hide_calendar(resize=False)
+        self.search_open = True
+        self.search_query = ""
+        self.search_var.set("")
+        self.view_label.pack_forget()
+        if self.all_btn.winfo_manager():
+            self.all_btn.pack_forget()
+        self.search_btn.pack_forget()
+        self.search_inner.pack(fill="x")
+        self._refresh_task_ui(scroll_top=True)
+        self.search_entry.focus_set()
+        self.search_entry.icursor("end")
+
+    def _close_search(self, refresh: bool = True) -> None:
+        if not self.search_open:
+            return
+        self.search_open = False
+        if self._search_after_id is not None:
+            try:
+                self.root.after_cancel(self._search_after_id)
+            except tk.TclError:
+                pass
+            self._search_after_id = None
+        self.search_query = ""
+        self.search_var.set("")
+        self.search_inner.pack_forget()
+        self.search_count.configure(text="")
+        self.view_label.pack(side="left")
+        self.search_btn.pack(side="right")
+        self._update_view_bar()
+        if refresh:
+            self._refresh_task_ui(scroll_top=True)
+
     def toggle_calendar(self) -> None:
         if self.calendar_open:
             self._hide_calendar()
@@ -1162,6 +1305,8 @@ class AgendaApp:
     def _show_calendar(self) -> None:
         if self.calendar_open:
             return
+        if self.search_open:
+            self._close_search(refresh=False)
         if self.collapsed:
             self.expand()
         target = self._compose_date() or date.today()
@@ -1433,10 +1578,15 @@ class AgendaApp:
         return sum(1 for task in self._tasks_on(value) if not task.get("done"))
 
     def _update_counts(self) -> None:
-        self.badge.configure(text=str(self._open_count_on(self._focus_date())))
+        if self.search_open:
+            self.badge.configure(text=str(len(self._search_matches())))
+        else:
+            self.badge.configure(text=str(self._open_count_on(self._focus_date())))
         self.pill_count.configure(text=str(self._open_count_on(date.today())))
 
     def _visible_tasks(self) -> list[dict]:
+        if self.search_open:
+            return self._search_matches()
         if self.selected_date is None:
             return self.tasks
         return self._tasks_on(self.selected_date)
@@ -1467,7 +1617,7 @@ class AgendaApp:
         for child in self.task_inner.winfo_children():
             child.destroy()
         if not visible:
-            self._build_empty_state(filtered=self.selected_date is not None)
+            self._build_empty_state(filtered=self.selected_date is not None, searching=self.search_open)
         else:
             for task in visible:
                 self._build_task_row(task)
@@ -1482,12 +1632,15 @@ class AgendaApp:
             self.task_canvas.yview_moveto(0.0)
         else:
             self.task_canvas.yview_moveto(old_pos)
+        if self.search_open:
+            query = self.search_query.strip()
+            self.search_count.configure(text=f"{len(visible)} 项" if query else f"全部 {len(visible)} 项")
         self._update_counts()
         self._update_view_bar()
         self._update_footer()
         self._schedule_resize()
 
-    def _build_empty_state(self, *, filtered: bool = False) -> None:
+    def _build_empty_state(self, *, filtered: bool = False, searching: bool = False) -> None:
         empty = tk.Frame(self.task_inner, bg=BG, pady=self.px(12))
         empty.pack(fill="x")
         icon = tk.Canvas(empty, width=self.px(34), height=self.px(34), bg=BG, highlightthickness=0, bd=0)
@@ -1520,17 +1673,24 @@ class AgendaApp:
             width=max(1, self.px(1)),
             capstyle=tk.ROUND,
         )
+        query = self.search_query.strip()
+        if searching:
+            title = "没有匹配的日程" if query else "还没有日程"
+            hint = "换个关键词，或点 × 退出搜索" if query else "在上方输入，按 Enter 添加"
+        elif filtered and self.selected_date:
+            title = f"{self._short_date(self.selected_date)}还没有日程"
+            hint = f"还有 {len(self.tasks)} 项其他日程，点“全部”查看" if self.tasks else "在上方输入，按 Enter 添加"
+        else:
+            title = "还没有日程"
+            hint = "在上方输入，按 Enter 添加"
         tk.Label(
             empty,
-            text=f"{self._short_date(self.selected_date)}还没有日程" if filtered and self.selected_date else "还没有日程",
+            text=title,
             bg=BG,
             fg=TEXT,
             font=self.f_body_bold,
             bd=0,
         ).pack(pady=(self.px(3), 0))
-        hint = "在上方输入，按 Enter 添加"
-        if filtered and self.tasks:
-            hint = f"还有 {len(self.tasks)} 项其他日程，点“全部”查看"
         tk.Label(
             empty,
             text=hint,
@@ -1741,6 +1901,22 @@ class AgendaApp:
                 widget.configure(bg=color)
 
     def _update_footer(self) -> None:
+        if self.search_open:
+            matches = self._search_matches()
+            total = len(matches)
+            open_count = sum(1 for task in matches if not task.get("done"))
+            text = f"搜索结果 · {total} 项" if self.search_query.strip() else f"全部 · {total} 项"
+            if open_count:
+                text += f" · {open_count} 项待办"
+            if self._save_error:
+                text = "保存失败"
+                self.footer_count.configure(fg=DANGER)
+            else:
+                self.footer_count.configure(fg=MUTED)
+            self.footer_count.configure(text=text)
+            if self.clear_btn.winfo_manager():
+                self.clear_btn.pack_forget()
+            return
         focus = self._focus_date()
         day_tasks = self._tasks_on(focus)
         open_count = sum(1 for task in day_tasks if not task.get("done"))
@@ -1761,6 +1937,8 @@ class AgendaApp:
             self.clear_btn.pack_forget()
 
     def _update_view_bar(self) -> None:
+        if self.search_open:
+            return
         text = self._long_date(self.selected_date) if self.selected_date is not None else "全部日程"
         if self.editing_task_id is not None:
             text = f"编辑中 · {text}"
@@ -1807,6 +1985,8 @@ class AgendaApp:
         text = " ".join(self.draft_var.get().replace("\r", " ").replace("\n", " ").split())[:240]
         if not text:
             return "break"
+        if self.search_open:
+            self._close_search(refresh=False)
         if self.calendar_open:
             self._hide_calendar(resize=False)
         due = self._compose_date() or date.today()
@@ -2125,6 +2305,10 @@ class AgendaApp:
             return
         if self.editing_task_id is not None:
             self._cancel_edit()
+            return
+        if self.search_open:
+            self._close_search()
+            self.entry.focus_set()
             return
         if not self.collapsed:
             self.collapse()
