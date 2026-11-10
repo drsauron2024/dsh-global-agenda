@@ -1425,7 +1425,7 @@ class AgendaApp:
             note = "DeepSeek Harness 未启动"
         elif sessions:
             if waiting:
-                summary = f"{len(waiting)} 个待授权"
+                summary = f"{len(waiting)} 个待处理"
                 summary_color = WARNING
                 dot_color = WARNING
             else:

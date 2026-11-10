@@ -238,10 +238,12 @@ def _friendly_tool(name: str) -> str:
 def _activity(parsed: _ParsedSession, now_ms: float) -> str:
     if parsed.approval_pending:
         return "等待批准"
+    if "exit_plan_mode" in parsed.open_tools:
+        return "等待确认计划"
+    if "ask_user_question" in parsed.open_tools:
+        return "等待你的回答"
     if parsed.open_tools:
         names = parsed.open_tools
-        if "ask_user_question" in names:
-            return "等待你的回答"
         first = _friendly_tool(names[0])
         if len(names) > 1:
             return f"正在执行{first}等 {len(names)} 项"
@@ -491,7 +493,11 @@ class DshMonitor:
                         step=parsed.step,
                         started_at=parsed.started_at,
                         last_event_at=parsed.last_event_at,
-                        needs_attention=parsed.approval_pending,
+                        needs_attention=(
+                            parsed.approval_pending
+                            or "exit_plan_mode" in parsed.open_tools
+                            or "ask_user_question" in parsed.open_tools
+                        ),
                     )
                 )
             sessions.sort(key=lambda item: item.last_event_at, reverse=True)
