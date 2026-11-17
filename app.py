@@ -1228,7 +1228,7 @@ class AgendaApp:
             self.entry.focus_set()
 
         def apply_time(value) -> None:
-            if value is None:
+            if value is None or (isinstance(value, str) and not value.strip()):
                 self._set_compose_time(None)
                 close()
                 return
