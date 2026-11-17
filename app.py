@@ -9,11 +9,16 @@ import threading
 import time
 import tkinter as tk
 from ctypes import wintypes
-from datetime import date, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import messagebox
 from typing import Optional
+
+try:
+    import winsound
+except ImportError:  # pragma: no cover - Windows-only overlay
+    winsound = None
 
 from agenda_store import LOG_FILE, app_data_dir, load_state, save_state
 from dsh_monitor import DshMonitor, HarnessSnapshot, focus_harness_window
@@ -256,7 +261,13 @@ class AgendaApp:
         self.calendar_month = today.month
         self.editing_task_id: Optional[str] = None
         self._edit_due: Optional[date] = None
+        self._edit_time: Optional[str] = None
         self._edit_previous: Optional[dict] = None
+        self.compose_time: Optional[str] = None
+        self._time_picker_window: Optional[tk.Toplevel] = None
+        self._reminder_window: Optional[tk.Toplevel] = None
+        self._reminder_items: list[tuple[dict, str]] = []
+        self._snoozed: dict[str, float] = {}
         self.search_open = False
         self.search_query = ""
         self._search_after_id: Optional[str] = None
@@ -284,11 +295,13 @@ class AgendaApp:
         self._apply_startup_geometry()
         self._start_monitor()
         self.root.after(350, self._poll_snapshots)
+        self.root.after(1500, self._check_reminders)
         self.root.after(50, lambda: apply_window_rounding(self.root, rounded=self._rounded_mode()))
         self.root.bind("<Escape>", self._on_escape)
         self.root.bind("<Control-q>", lambda _event: self.close())
         self.root.bind("<Control-n>", self._focus_entry)
         self.root.bind("<Control-f>", self._focus_search)
+        self.root.bind("<Control-t>", self._focus_today)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     # ------------------------------------------------------------------ setup
@@ -688,6 +701,21 @@ class AgendaApp:
         self.date_chip.bind("<Button-1>", lambda _event: self.toggle_calendar())
         self.date_chip.bind("<Enter>", lambda _event: self.date_chip.configure(bg=CARD_HOVER))
         self.date_chip.bind("<Leave>", lambda _event: self._render_compose_controls())
+        self.time_chip = tk.Label(
+            compose_row,
+            text="",
+            font=self.f_tiny_bold,
+            fg=MUTED,
+            bg=CARD,
+            padx=self.px(6),
+            pady=self.px(2),
+            bd=0,
+            cursor="hand2",
+        )
+        self.time_chip.pack(side="right", padx=(0, self.px(4)), before=self.date_chip)
+        self.time_chip.bind("<Button-1>", lambda _event: self._open_time_picker())
+        self.time_chip.bind("<Enter>", lambda _event: self.time_chip.configure(bg=CARD_HOVER))
+        self.time_chip.bind("<Leave>", lambda _event: self._render_compose_controls())
         self._render_compose_controls()
 
         tk.Frame(self.main, bg=BORDER_SOFT, height=1).pack(fill="x", padx=self.px(13))
@@ -733,6 +761,19 @@ class AgendaApp:
             pady=0,
         )
         self.search_btn.pack(side="right")
+        self.today_btn = self._flat_button(
+            self.view_bar,
+            "今天",
+            self.show_today,
+            font=self.f_tiny,
+            fg=ACCENT,
+            hover_fg=ACCENT_HOVER,
+            bg=BG,
+            hover_bg=CARD_HOVER,
+            padx=self.px(4),
+            pady=0,
+        )
+        self.today_btn.pack(side="right", padx=(0, self.px(2)))
         self.search_inner = tk.Frame(self.view_bar, bg=BG)
         self.search_border = tk.Frame(self.search_inner, bg=BORDER)
         self.search_border.pack(side="left", fill="x", expand=True)
@@ -967,10 +1008,48 @@ class AgendaApp:
             return self._edit_due
         return self.selected_date or date.today()
 
-    def _due_text(self, value: Optional[date], done: bool) -> str:
+    def _compose_time_value(self) -> Optional[str]:
+        if self.editing_task_id is not None:
+            return self._edit_time
+        return self.compose_time
+
+    @staticmethod
+    def _normalize_clock(value: str) -> Optional[str]:
+        try:
+            parsed = datetime.strptime(value.strip(), "%H:%M")
+        except (ValueError, AttributeError):
+            return None
+        return parsed.strftime("%H:%M")
+
+    def _set_compose_time(self, value: Optional[str]) -> None:
+        if self.editing_task_id is not None:
+            self._edit_time = value
+            if value is not None and self._edit_due is None:
+                self._edit_due = date.today()
+        else:
+            self.compose_time = value
+        self._render_compose_controls()
+
+    def _task_time(self, task: dict) -> Optional[str]:
+        return self._normalize_clock(task.get("time")) if isinstance(task.get("time"), str) else None
+
+    def _task_deadline(self, task: dict) -> Optional[datetime]:
+        due = self._task_date(task)
+        at = self._task_time(task)
+        if due is None or at is None:
+            return None
+        try:
+            clock = datetime_time.fromisoformat(at)
+        except ValueError:
+            return None
+        return datetime.combine(due, clock)
+
+    def _due_text(self, value: Optional[date], done: bool, at: Optional[str] = None) -> str:
         if value is None:
             return "未安排"
         text = self._short_date(value)
+        if at:
+            text = f"{text} {at}"
         if not done and value < date.today():
             return f"逾期 · {text}"
         return text
@@ -1020,7 +1099,167 @@ class AgendaApp:
             fg = ACCENT if self.selected_date else MUTED
             bg = CARD
         self.date_chip.configure(text=text, fg=fg, bg=bg)
+        if hasattr(self, "time_chip"):
+            time_value = self._compose_time_value()
+            self.time_chip.configure(
+                text=f"限时 · {time_value}" if time_value else "限时 · 无",
+                fg=ACCENT if time_value else MUTED,
+                bg=CARD,
+            )
         self._sync_placeholder()
+
+    def _open_time_picker(self) -> None:
+        if self._time_picker_window is not None:
+            try:
+                self._time_picker_window.lift()
+                return
+            except tk.TclError:
+                self._time_picker_window = None
+        if self.calendar_open:
+            self._hide_calendar()
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=BORDER)
+        self._time_picker_window = win
+        body = tk.Frame(win, bg=BG, padx=self.px(12), pady=self.px(10))
+        body.pack(fill="both", expand=True, padx=1, pady=1)
+        tk.Label(
+            body,
+            text="设置限时提醒",
+            bg=BG,
+            fg=TEXT,
+            font=self.f_body_bold,
+            bd=0,
+        ).pack(anchor="w")
+        row = tk.Frame(body, bg=BG)
+        row.pack(fill="x", pady=(self.px(7), self.px(3)))
+        tk.Label(row, text="时间", bg=BG, fg=MUTED, font=self.f_tiny, bd=0).pack(side="left")
+        current = self._compose_time_value() or "09:00"
+        entry = tk.Entry(
+            row,
+            width=6,
+            justify="center",
+            font=self.f_body_bold,
+            fg=TEXT,
+            bg=INPUT_BG,
+            insertbackground=TEXT,
+            selectbackground=ACCENT,
+            selectforeground=ON_ACCENT,
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+        )
+        entry.pack(side="left", padx=(self.px(7), self.px(6)), ipady=self.px(3))
+        entry.insert(0, current)
+        entry.select_range(0, "end")
+        tk.Label(row, text="HH:MM，留空或点“清除”=不限时", bg=BG, fg=DIM, font=self.f_tiny, bd=0).pack(side="left")
+        error = tk.Label(body, text="", bg=BG, fg=DANGER, font=self.f_tiny, bd=0)
+        error.pack(anchor="w")
+        buttons = tk.Frame(body, bg=BG)
+        buttons.pack(fill="x", pady=(self.px(5), 0))
+        clear_btn = tk.Button(
+            buttons,
+            text="清除",
+            command=lambda: apply_time(None),
+            font=self.f_tiny,
+            fg=MUTED,
+            bg=CARD,
+            activeforeground=TEXT,
+            activebackground=CARD_HOVER,
+            bd=0,
+            relief="flat",
+            highlightthickness=0,
+            padx=self.px(8),
+            pady=self.px(3),
+            cursor="hand2",
+        )
+        clear_btn.pack(side="left")
+        cancel_btn = tk.Button(
+            buttons,
+            text="取消",
+            command=lambda: close(),
+            font=self.f_tiny,
+            fg=MUTED,
+            bg=BG,
+            activeforeground=TEXT,
+            activebackground=CARD_HOVER,
+            bd=0,
+            relief="flat",
+            highlightthickness=0,
+            padx=self.px(8),
+            pady=self.px(3),
+            cursor="hand2",
+        )
+        ok_btn = tk.Button(
+            buttons,
+            text="确定",
+            command=lambda: apply_time(entry.get()),
+            font=self.f_tiny_bold,
+            fg=ON_ACCENT,
+            bg=ACCENT,
+            activeforeground=ON_ACCENT,
+            activebackground=ACCENT_HOVER,
+            bd=0,
+            relief="flat",
+            highlightthickness=0,
+            padx=self.px(10),
+            pady=self.px(3),
+            cursor="hand2",
+        )
+        ok_btn.pack(side="right", padx=(0, self.px(5)))
+        cancel_btn.pack(side="right", padx=(0, self.px(4)))
+
+        def close() -> None:
+            if self._time_picker_window is not win:
+                return
+            try:
+                win.grab_release()
+            except tk.TclError:
+                pass
+            self._time_picker_window = None
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+            self.entry.focus_set()
+
+        def apply_time(value) -> None:
+            if value is None:
+                self._set_compose_time(None)
+                close()
+                return
+            normalized = self._normalize_clock(value)
+            if normalized is None:
+                error.configure(text="请输入 HH:MM，例如 09:30")
+                entry.focus_set()
+                entry.select_range(0, "end")
+                return
+            self._set_compose_time(normalized)
+            close()
+
+        win.bind("<Return>", lambda _event: apply_time(entry.get()))
+        win.bind("<Escape>", lambda _event: close())
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.update_idletasks()
+        width = win.winfo_reqwidth()
+        height = win.winfo_reqheight()
+        left, top, right, bottom = work_area()
+        x = self.time_chip.winfo_rootx() + self.time_chip.winfo_width() - width
+        y = self.time_chip.winfo_rooty() + self.time_chip.winfo_height() + self.px(4)
+        x = min(max(x, left + 8), max(left + 8, right - width - 8))
+        y = min(max(y, top + 8), max(top + 8, bottom - height - 8))
+        win.geometry(f"{width}x{height}+{x}+{y}")
+        win.deiconify()
+        win.lift()
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+        entry.focus_set()
 
     # --------------------------------------------------------------- calendar
     def _build_calendar(self) -> None:
@@ -1222,6 +1461,22 @@ class AgendaApp:
         self._refresh_task_ui(scroll_top=True)
         self.entry.focus_set()
 
+    def show_today(self) -> None:
+        if self.search_open:
+            self._close_search(refresh=False)
+        if self.calendar_open:
+            self._hide_calendar(resize=False)
+        self.selected_date = date.today()
+        self._render_compose_controls()
+        self._refresh_task_ui(scroll_top=True)
+        self.entry.focus_set()
+
+    def _focus_today(self, _event=None) -> str:
+        if self.collapsed:
+            self.expand()
+        self.show_today()
+        return "break"
+
     def _search_matches(self) -> list[dict]:
         query = self.search_query.strip().casefold()
         if not query:
@@ -1270,6 +1525,8 @@ class AgendaApp:
         self.view_label.pack_forget()
         if self.all_btn.winfo_manager():
             self.all_btn.pack_forget()
+        if self.today_btn.winfo_manager():
+            self.today_btn.pack_forget()
         self.search_btn.pack_forget()
         self.search_inner.pack(fill="x")
         self._refresh_task_ui(scroll_top=True)
@@ -1292,6 +1549,7 @@ class AgendaApp:
         self.search_count.configure(text="")
         self.view_label.pack(side="left")
         self.search_btn.pack(side="right")
+        self.today_btn.pack(side="right", padx=(0, self.px(2)))
         self._update_view_bar()
         if refresh:
             self._refresh_task_ui(scroll_top=True)
@@ -1362,6 +1620,200 @@ class AgendaApp:
             self.pill_chevron.pack(side="right", padx=(self.px(6), 0))
         size = self.px(8)
         self.pill_live_dot.create_oval(0, 0, size, size, fill=color, outline="")
+
+    def _check_reminders(self) -> None:
+        if self._closing:
+            return
+        if self._reminder_window is None and self._time_picker_window is None:
+            due = self._due_reminders()
+            if due:
+                self._show_reminder(due)
+        self.root.after(15000, self._check_reminders)
+
+    def _due_reminders(self) -> list[tuple[dict, str]]:
+        now = datetime.now()
+        result: list[tuple[dict, str]] = []
+        for task in self.tasks:
+            if task.get("done") or not task.get("time"):
+                continue
+            deadline = self._task_deadline(task)
+            if deadline is None or deadline > now:
+                continue
+            if now - deadline > timedelta(hours=24):
+                continue
+            key = deadline.strftime("%Y-%m-%d %H:%M")
+            if task.get("reminded_for") == key:
+                continue
+            if self._snoozed.get(task["id"], 0.0) > time.time():
+                continue
+            result.append((task, key))
+        result.sort(key=lambda item: item[1])
+        return result
+
+    def _show_reminder(self, items: list[tuple[dict, str]]) -> None:
+        if self._reminder_window is not None:
+            return
+        self._reminder_items = items
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=BORDER)
+        self._reminder_window = win
+        body = tk.Frame(win, bg=BG, padx=self.px(13), pady=self.px(11))
+        body.pack(fill="both", expand=True, padx=1, pady=1)
+        head = tk.Frame(body, bg=BG)
+        head.pack(fill="x")
+        dot = tk.Canvas(head, width=self.px(9), height=self.px(9), bg=BG, highlightthickness=0, bd=0)
+        dot.pack(side="left", padx=(0, self.px(7)), pady=(self.px(2), 0))
+        size = self.px(9)
+        dot.create_oval(0, 0, size, size, fill=WARNING, outline="")
+        tk.Label(head, text="日程提醒", bg=BG, fg=TEXT, font=self.f_body_bold, bd=0).pack(side="left")
+        tk.Label(
+            head,
+            text=f"{len(items)} 项到时间",
+            bg=BG,
+            fg=WARNING,
+            font=self.f_tiny_bold,
+            bd=0,
+        ).pack(side="right")
+        for task, key in items[:5]:
+            row = tk.Frame(body, bg=CARD, padx=self.px(8), pady=self.px(5))
+            row.pack(fill="x", pady=(self.px(4), 0))
+            bar = tk.Frame(row, bg=SEVERITY_COLORS[self._severity_of(task)], width=self.px(3))
+            bar.pack(side="left", fill="y")
+            text = tk.Label(
+                row,
+                text=ellipsize(task.get("text", ""), 34),
+                bg=CARD,
+                fg=TEXT,
+                font=self.f_small_bold,
+                anchor="w",
+                bd=0,
+            )
+            text.pack(side="left", fill="x", expand=True, padx=(self.px(7), 0))
+            tk.Label(
+                row,
+                text=key[5:] if len(key) >= 16 else key,
+                bg=CARD,
+                fg=WARNING,
+                font=self.f_tiny_bold,
+                bd=0,
+            ).pack(side="right")
+        if len(items) > 5:
+            tk.Label(
+                body,
+                text=f"还有 {len(items) - 5} 项",
+                bg=BG,
+                fg=MUTED,
+                font=self.f_tiny,
+                bd=0,
+            ).pack(anchor="w", pady=(self.px(4), 0))
+        buttons = tk.Frame(body, bg=BG)
+        buttons.pack(fill="x", pady=(self.px(9), 0))
+        snooze = tk.Button(
+            buttons,
+            text="稍后 5 分钟",
+            command=self._snooze_reminder,
+            font=self.f_tiny,
+            fg=MUTED,
+            bg=CARD,
+            activeforeground=TEXT,
+            activebackground=CARD_HOVER,
+            bd=0,
+            relief="flat",
+            highlightthickness=0,
+            padx=self.px(8),
+            pady=self.px(3),
+            cursor="hand2",
+        )
+        snooze.pack(side="left")
+        view = tk.Button(
+            buttons,
+            text="查看",
+            command=self._view_reminder,
+            font=self.f_tiny,
+            fg=ACCENT,
+            bg=BG,
+            activeforeground=ACCENT_HOVER,
+            activebackground=CARD_HOVER,
+            bd=0,
+            relief="flat",
+            highlightthickness=0,
+            padx=self.px(8),
+            pady=self.px(3),
+            cursor="hand2",
+        )
+        ok = tk.Button(
+            buttons,
+            text="知道了",
+            command=self._acknowledge_reminder,
+            font=self.f_tiny_bold,
+            fg=ON_ACCENT,
+            bg=ACCENT,
+            activeforeground=ON_ACCENT,
+            activebackground=ACCENT_HOVER,
+            bd=0,
+            relief="flat",
+            highlightthickness=0,
+            padx=self.px(10),
+            pady=self.px(3),
+            cursor="hand2",
+        )
+        ok.pack(side="right")
+        view.pack(side="right", padx=(0, self.px(4)))
+        win.protocol("WM_DELETE_WINDOW", self._acknowledge_reminder)
+        win.update_idletasks()
+        width = max(self.px(320), win.winfo_reqwidth())
+        height = win.winfo_reqheight()
+        left, top, right, bottom = work_area()
+        x = right - width - self.px(16)
+        y = bottom - height - self.px(16)
+        x = min(max(x, left + 8), max(left + 8, right - width - 8))
+        y = min(max(y, top + 8), max(top + 8, bottom - height - 8))
+        win.geometry(f"{width}x{height}+{x}+{y}")
+        win.deiconify()
+        win.lift()
+        try:
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except Exception:
+            pass
+
+    def _acknowledge_reminder(self) -> None:
+        for task, key in getattr(self, "_reminder_items", []):
+            if any(item["id"] == task["id"] for item in self.tasks):
+                task["reminded_for"] = key
+        self._reminder_items = []
+        self._close_reminder_window()
+        self._save_tasks()
+
+    def _snooze_reminder(self) -> None:
+        until = time.time() + 300
+        for task, _key in getattr(self, "_reminder_items", []):
+            self._snoozed[task["id"]] = until
+        self._reminder_items = []
+        self._close_reminder_window()
+
+    def _view_reminder(self) -> None:
+        target = self._task_date(self._reminder_items[0][0]) if self._reminder_items else None
+        self._acknowledge_reminder()
+        self.expand()
+        if target is not None:
+            self.selected_date = target
+            self._render_compose_controls()
+            self._refresh_task_ui(scroll_top=True)
+            self.entry.focus_set()
+        else:
+            self.show_today()
+
+    def _close_reminder_window(self) -> None:
+        win = self._reminder_window
+        self._reminder_window = None
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
 
     def _render_snapshot(self, snapshot: Optional[HarnessSnapshot]) -> None:
         if self._closing:
@@ -1706,6 +2158,7 @@ class AgendaApp:
         severity = self._severity_of(task)
         severity_color = BORDER if done else SEVERITY_COLORS[severity]
         due = self._task_date(task)
+        at = self._task_time(task)
         row = tk.Frame(self.task_inner, bg=BG, cursor="hand2")
         row.pack(fill="x", pady=self.px(1))
         bar = tk.Frame(row, bg=severity_color, width=self.px(3), cursor="hand2")
@@ -1789,9 +2242,12 @@ class AgendaApp:
         )
         separator.pack(side="left")
         overdue = due is not None and not done and due < date.today()
+        deadline = self._task_deadline(task)
+        if deadline is not None:
+            overdue = not done and deadline < datetime.now()
         date_label = tk.Label(
             meta,
-            text=self._due_text(due, done),
+            text=self._due_text(due, done, at),
             bg=BG,
             fg=DANGER if overdue else (DIM if done else MUTED),
             font=self.f_tiny,
@@ -1997,6 +2453,8 @@ class AgendaApp:
             "created_at": time.time(),
             "severity": self.compose_severity,
             "due": due.isoformat(),
+            "time": self.compose_time,
+            "reminded_for": None,
         }
         self.tasks.insert(0, task)
         self.draft_var.set("")
@@ -2020,9 +2478,11 @@ class AgendaApp:
         self._edit_previous = {
             "draft": self.draft_var.get(),
             "severity": self.compose_severity,
+            "time": self.compose_time,
         }
         self.editing_task_id = task_id
         self._edit_due = self._task_date(task)
+        self._edit_time = self._task_time(task)
         self.compose_severity = self._severity_of(task)
         self.draft_var.set(task.get("text", ""))
         self.add_btn.configure(text="保存", font=self.f_tiny_bold, padx=self.px(8))
@@ -2042,9 +2502,16 @@ class AgendaApp:
             return "break"
         task = next((item for item in self.tasks if item["id"] == task_id), None)
         if task is not None:
+            if self._edit_time is not None and self._edit_due is None:
+                self._edit_due = date.today()
+            old_due = task.get("due")
+            old_time = task.get("time")
             task["text"] = text
             task["severity"] = self.compose_severity
             task["due"] = self._edit_due.isoformat() if self._edit_due is not None else None
+            task["time"] = self._edit_time
+            if task["due"] != old_due or task["time"] != old_time:
+                task["reminded_for"] = None
         self._finish_edit(restore_draft=True)
         self._refresh_task_ui(scroll_top=False)
         self._save_tasks()
@@ -2062,12 +2529,14 @@ class AgendaApp:
         previous = self._edit_previous or {}
         self.editing_task_id = None
         self._edit_due = None
+        self._edit_time = None
         self._edit_previous = None
         self.add_btn.configure(text="+", font=self.f_plus, padx=self.px(8))
         if self.cancel_edit_btn.winfo_manager():
             self.cancel_edit_btn.pack_forget()
         self.draft_var.set(previous.get("draft", "") if restore_draft else "")
         self.compose_severity = previous.get("severity", self.compose_severity)
+        self.compose_time = previous.get("time", self.compose_time)
         self._render_compose_controls()
 
     def _toggle_task(self, task_id: str) -> None:

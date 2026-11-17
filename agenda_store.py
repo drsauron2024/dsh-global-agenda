@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from datetime import date
 from pathlib import Path
@@ -12,6 +13,8 @@ from typing import Any
 
 APP_DIR_NAME = "DshGlobalAgenda"
 VALID_SEVERITIES = ("high", "medium", "low")
+TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+REMINDER_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
 
 
 def app_data_dir() -> Path:
@@ -49,9 +52,23 @@ def _clean_due(value: Any) -> str | None:
         return None
 
 
+def _clean_time(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    return candidate if TIME_RE.fullmatch(candidate) else None
+
+
+def _clean_reminded_for(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    return candidate if REMINDER_RE.fullmatch(candidate) else None
+
+
 def default_state() -> dict[str, Any]:
     return {
-        "version": 2,
+        "version": 3,
         "tasks": [],
         "window": {"x": None, "y": None, "collapsed": False, "mode": "dock"},
     }
@@ -82,6 +99,8 @@ def _normalise_task(raw: Any) -> dict[str, Any] | None:
         "created_at": float(created),
         "severity": severity,
         "due": _clean_due(raw.get("due")),
+        "time": _clean_time(raw.get("time")),
+        "reminded_for": _clean_reminded_for(raw.get("reminded_for")),
     }
 
 
@@ -120,7 +139,7 @@ def save_state(tasks: list[dict[str, Any]], window: dict[str, Any]) -> None:
     directory = app_data_dir()
     directory.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": 2,
+        "version": 3,
         "tasks": tasks,
         "window": {
             "x": window.get("x"),
