@@ -428,10 +428,10 @@ class AgendaApp:
         self.pill = tk.Frame(self.shell, bg=BG)
         self._build_main()
         self._build_pill()
+        self.main.place(x=0, y=0, width=self.W)
         if self.collapsed:
-            self.pill.pack(fill="both", expand=True)
-        else:
-            self.main.pack(fill="both", expand=True)
+            self.pill.place(x=0, y=0, relwidth=1, relheight=1)
+            self.pill.lift()
 
     def _build_main(self) -> None:
         header = tk.Frame(self.main, bg=BG, padx=self.px(13), pady=self.px(10))
@@ -2772,6 +2772,7 @@ class AgendaApp:
         left, top, right, bottom = work_area()
         max_height = max(self.px(180), bottom - top - 16)
         height = min(height, max_height)
+        self.main.place_configure(width=width, height=max(height - 2, 1))
         self.log.debug("resize width=%s height=%s x=%s y=%s", width, height, self._x, self._y)
         self._place_window(width, height, force=force)
 
@@ -2787,6 +2788,7 @@ class AgendaApp:
             height = max(self.px(240), bottom - top)
             x = right - width
             y = top
+            self.main.place_configure(width=width, height=max(height - 2, 1))
         self.log.debug("dock width=%s height=%s x=%s y=%s collapsed=%s", width, height, x, y, self.collapsed)
         self._set_geometry(width, height, x, y, force=force)
 
@@ -2822,8 +2824,8 @@ class AgendaApp:
             self._hide_calendar(resize=False)
         if self.mode == "floating":
             self._anchor_right_edge(self.W, self.PILL_W)
-        self.main.pack_forget()
-        self.pill.pack(fill="both", expand=True)
+        self.pill.place(x=0, y=0, relwidth=1, relheight=1)
+        self.pill.lift()
         self.collapsed = True
         self.root.update_idletasks()
         self._resize_to_fit(force=True)
@@ -2835,8 +2837,8 @@ class AgendaApp:
             return
         if self.mode == "floating":
             self._anchor_right_edge(self.PILL_W, self.W)
-        self.pill.pack_forget()
-        self.main.pack(fill="both", expand=True)
+        self.pill.place_forget()
+        self.main.lift()
         self.collapsed = False
         self._configure_mode_layout()
         self.root.update_idletasks()
@@ -2846,8 +2848,8 @@ class AgendaApp:
 
     def toggle_mode(self) -> None:
         if self.collapsed:
-            self.pill.pack_forget()
-            self.main.pack(fill="both", expand=True)
+            self.pill.place_forget()
+            self.main.lift()
             self.collapsed = False
         if self.mode == "dock":
             self.mode = "floating"
