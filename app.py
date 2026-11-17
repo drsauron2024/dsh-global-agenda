@@ -265,6 +265,9 @@ class AgendaApp:
         self._edit_previous: Optional[dict] = None
         self.compose_time: Optional[str] = None
         self._time_picker_window: Optional[tk.Toplevel] = None
+        self._task_rows: dict[str, tk.Frame] = {}
+        self._task_row_signatures: dict[str, tuple] = {}
+        self._shown_task_ids: list[str] = []
         self._reminder_window: Optional[tk.Toplevel] = None
         self._reminder_items: list[tuple[dict, str]] = []
         self._snoozed: dict[str, float] = {}
@@ -280,6 +283,7 @@ class AgendaApp:
         self._last_geometry = ""
         self._last_snapshot_signature = None
         self._latest_snapshot: Optional[HarnessSnapshot] = None
+        self._elapsed_labels: dict[str, tuple[tk.Label, float]] = {}
         self._save_error = ""
         self._closing = False
 
@@ -296,6 +300,7 @@ class AgendaApp:
         self._start_monitor()
         self.root.after(350, self._poll_snapshots)
         self.root.after(1500, self._check_reminders)
+        self.root.after(5000, self._tick_elapsed)
         self.root.after(50, lambda: apply_window_rounding(self.root, rounded=self._rounded_mode()))
         self.root.bind("<Escape>", self._on_escape)
         self.root.bind("<Control-q>", lambda _event: self.close())
@@ -1815,6 +1820,17 @@ class AgendaApp:
             except tk.TclError:
                 pass
 
+    def _tick_elapsed(self) -> None:
+        if self._closing:
+            return
+        now_ms = time.time() * 1000.0
+        for session_id, (label, started_at) in list(self._elapsed_labels.items()):
+            try:
+                label.configure(text=format_elapsed(now_ms - started_at) if started_at else "")
+            except tk.TclError:
+                self._elapsed_labels.pop(session_id, None)
+        self.root.after(5000, self._tick_elapsed)
+
     def _render_snapshot(self, snapshot: Optional[HarnessSnapshot]) -> None:
         if self._closing:
             return
@@ -1833,13 +1849,14 @@ class AgendaApp:
                         task.activity,
                         task.turn,
                         task.step,
-                        int(max(0.0, now_ms - task.started_at) / 5000) if task.started_at else 0,
+                        task.started_at,
                         task.needs_attention,
                     )
                     for task in snapshot.sessions
                 ),
             )
         if snapshot is None:
+            self._elapsed_labels.clear()
             for child in self.running_box.winfo_children():
                 child.destroy()
             self.status_summary.configure(text="读取中", fg=MUTED)
@@ -1856,6 +1873,7 @@ class AgendaApp:
         self._last_snapshot_signature = signature
         self._latest_snapshot = snapshot
 
+        self._elapsed_labels.clear()
         for child in self.running_box.winfo_children():
             child.destroy()
 
@@ -1972,6 +1990,7 @@ class AgendaApp:
             bd=0,
         )
         elapsed.pack(side="right", padx=(self.px(8), 0))
+        self._elapsed_labels[task.session_id] = (elapsed, task.started_at)
         detail = tk.Frame(inner, bg=CARD)
         detail.pack(fill="x", pady=(self.px(1), 0))
         activity = tk.Label(
@@ -2063,27 +2082,103 @@ class AgendaApp:
             self._save_error = str(exc)
             self.log.exception("Could not save window state")
 
+    def _row_signature(self, task: dict) -> tuple:
+        return (
+            task.get("text"),
+            bool(task.get("done")),
+            self._severity_of(task),
+            task.get("due"),
+            task.get("time"),
+            task["id"] == self.editing_task_id,
+        )
+
+    def _sync_task_rows(self) -> bool:
+        changed = False
+        current_ids = {task["id"] for task in self.tasks}
+        for task_id in list(self._task_rows):
+            if task_id not in current_ids:
+                self._task_rows.pop(task_id).destroy()
+                self._task_row_signatures.pop(task_id, None)
+                if task_id in self._shown_task_ids:
+                    self._shown_task_ids.remove(task_id)
+                changed = True
+        for task in self.tasks:
+            task_id = task["id"]
+            signature = self._row_signature(task)
+            if self._task_row_signatures.get(task_id) == signature and task_id in self._task_rows:
+                continue
+            old = self._task_rows.pop(task_id, None)
+            if old is not None:
+                old.destroy()
+                if task_id in self._shown_task_ids:
+                    self._shown_task_ids.remove(task_id)
+            self._build_task_row(task)
+            self._task_row_signatures[task_id] = signature
+            changed = True
+        row_widgets = {id(row) for row in self._task_rows.values()}
+        for child in self.task_inner.winfo_children():
+            if id(child) not in row_widgets:
+                child.destroy()
+                changed = True
+        return changed
+
+    def _show_task_rows(self, visible: list[dict]) -> bool:
+        changed = False
+        if not visible:
+            for task_id in self._shown_task_ids:
+                row = self._task_rows.get(task_id)
+                if row is not None and row.winfo_manager():
+                    row.pack_forget()
+                    changed = True
+            self._shown_task_ids = []
+            self._build_empty_state(filtered=self.selected_date is not None, searching=self.search_open)
+            return True
+        visible_ids = [task["id"] for task in visible]
+        visible_set = set(visible_ids)
+        for task_id in list(self._shown_task_ids):
+            if task_id not in visible_set:
+                row = self._task_rows.get(task_id)
+                if row is not None and row.winfo_manager():
+                    row.pack_forget()
+                    changed = True
+                self._shown_task_ids.remove(task_id)
+        for index, task_id in enumerate(visible_ids):
+            row = self._task_rows.get(task_id)
+            if row is None or row.winfo_manager():
+                continue
+            before = None
+            for later_id in visible_ids[index + 1:]:
+                later = self._task_rows.get(later_id)
+                if later is not None and later.winfo_manager():
+                    before = later
+                    break
+            if before is None:
+                row.pack(fill="x", pady=self.px(1))
+            else:
+                row.pack(fill="x", pady=self.px(1), before=before)
+            changed = True
+        self._shown_task_ids = visible_ids
+        return changed
+
     def _refresh_task_ui(self, *, scroll_top: bool = False) -> None:
         old_pos = self.task_canvas.yview()[0] if self.task_canvas.winfo_exists() else 0.0
         visible = self._visible_tasks()
-        for child in self.task_inner.winfo_children():
-            child.destroy()
-        if not visible:
-            self._build_empty_state(filtered=self.selected_date is not None, searching=self.search_open)
-        else:
-            for task in visible:
-                self._build_task_row(task)
-        self.task_inner.update_idletasks()
-        content_height = max(self.task_inner.winfo_reqheight(), 1)
-        work = work_area()
-        max_height = min(self.px(300), int((work[3] - work[1]) * 0.36))
-        target_height = min(max(content_height, self.px(46)), max_height)
-        self.task_canvas.configure(height=target_height)
-        self.task_canvas.configure(scrollregion=(0, 0, max(self.task_canvas.winfo_width(), 1), content_height))
-        if scroll_top:
+        rows_changed = self._sync_task_rows()
+        shown_changed = self._show_task_rows(visible)
+        if rows_changed or shown_changed:
+            self.task_inner.update_idletasks()
+            content_height = max(self.task_inner.winfo_reqheight(), 1)
+            work = work_area()
+            max_height = min(self.px(300), int((work[3] - work[1]) * 0.36))
+            target_height = min(max(content_height, self.px(46)), max_height)
+            self.task_canvas.configure(height=target_height)
+            self.task_canvas.configure(scrollregion=(0, 0, max(self.task_canvas.winfo_width(), 1), content_height))
+            if scroll_top:
+                self.task_canvas.yview_moveto(0.0)
+            else:
+                self.task_canvas.yview_moveto(old_pos)
+        elif scroll_top:
             self.task_canvas.yview_moveto(0.0)
-        else:
-            self.task_canvas.yview_moveto(old_pos)
         if self.search_open:
             query = self.search_query.strip()
             self.search_count.configure(text=f"{len(visible)} 项" if query else f"全部 {len(visible)} 项")
@@ -2160,7 +2255,6 @@ class AgendaApp:
         due = self._task_date(task)
         at = self._task_time(task)
         row = tk.Frame(self.task_inner, bg=BG, cursor="hand2")
-        row.pack(fill="x", pady=self.px(1))
         bar = tk.Frame(row, bg=severity_color, width=self.px(3), cursor="hand2")
         bar.pack(side="left", fill="y")
         inner = tk.Frame(row, bg=BG, padx=self.px(6), pady=self.px(5), cursor="hand2")
@@ -2305,6 +2399,7 @@ class AgendaApp:
         edit.bind("<Leave>", lambda _event: edit.configure(fg=ACCENT if editing else DIM), add="+")
         delete.bind("<Enter>", lambda _event: delete.configure(fg=DANGER), add="+")
         delete.bind("<Leave>", lambda _event: delete.configure(fg=DIM), add="+")
+        self._task_rows[task["id"]] = row
 
     def _show_priority_menu(self, event, task_id: str) -> str:
         current = "medium"
@@ -2866,7 +2961,7 @@ class AgendaApp:
                 snapshot = self.snapshots.get_nowait()
             except queue.Empty:
                 break
-        if snapshot is not None:
+        if snapshot is not None and snapshot is not self._latest_snapshot:
             self._render_snapshot(snapshot)
         self.root.after(500, self._poll_snapshots)
 

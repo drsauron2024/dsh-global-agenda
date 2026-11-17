@@ -31,6 +31,8 @@ PROCESS_NAMES = {
     "dsh.exe",
 }
 SCAN_INTERVAL_SECONDS = 6.0
+PROCESS_CHECK_SECONDS = 5.0
+WINDOW_CHECK_SECONDS = 10.0
 MAX_SESSION_FILES = 240
 STALE_TURN_SECONDS = 12 * 60 * 60
 
@@ -288,10 +290,14 @@ class DshMonitor:
         self._last_scan = 0.0
         self._process_known: Optional[bool] = None
         self._process_checked = 0.0
+        self._window_known: Optional[bool] = None
+        self._window_checked = 0.0
+        self._last_snapshot: Optional[HarnessSnapshot] = None
+        self._last_snapshot_key: Optional[tuple] = None
 
     def _detect_process(self) -> bool:
         now = time.monotonic()
-        if self._process_known is not None and now - self._process_checked < 4.0:
+        if self._process_known is not None and now - self._process_checked < PROCESS_CHECK_SECONDS:
             return self._process_known
         try:
             present = process_running()
@@ -299,6 +305,18 @@ class DshMonitor:
             present = True
         self._process_known = present
         self._process_checked = now
+        return present
+
+    def _detect_window(self) -> bool:
+        now = time.monotonic()
+        if self._window_known is not None and now - self._window_checked < WINDOW_CHECK_SECONDS:
+            return self._window_known
+        try:
+            present = bool(find_harness_windows())
+        except Exception:
+            present = False
+        self._window_known = present
+        self._window_checked = now
         return present
 
     def _scan(self) -> list[Path]:
@@ -466,11 +484,36 @@ class DshMonitor:
         self._cache[str(path)] = (signature, parsed)
         return parsed
 
+    def _cache_snapshot(self, snapshot: HarnessSnapshot) -> HarnessSnapshot:
+        key = (
+            snapshot.process_running,
+            snapshot.window_present,
+            snapshot.error,
+            tuple(
+                (
+                    task.session_id,
+                    task.title,
+                    task.activity,
+                    task.turn,
+                    task.step,
+                    task.started_at,
+                    task.last_event_at,
+                    task.needs_attention,
+                )
+                for task in snapshot.sessions
+            ),
+        )
+        if self._last_snapshot is not None and key == self._last_snapshot_key:
+            return self._last_snapshot
+        self._last_snapshot = snapshot
+        self._last_snapshot_key = key
+        return snapshot
+
     def snapshot(self) -> HarnessSnapshot:
         try:
             if not self._detect_process():
-                return HarnessSnapshot(False, False, ())
-            windows = find_harness_windows()
+                return self._cache_snapshot(HarnessSnapshot(False, False, ()))
+            window_present = self._detect_window()
             now_ms = time.time() * 1000.0
             sessions: list[RunningTask] = []
             seen: set[str] = set()
@@ -501,6 +544,6 @@ class DshMonitor:
                     )
                 )
             sessions.sort(key=lambda item: item.last_event_at, reverse=True)
-            return HarnessSnapshot(True, bool(windows), tuple(sessions))
+            return self._cache_snapshot(HarnessSnapshot(True, window_present, tuple(sessions)))
         except Exception as exc:  # Keep the overlay alive if a log is unreadable.
-            return HarnessSnapshot(False, False, (), str(exc))
+            return self._cache_snapshot(HarnessSnapshot(False, False, (), str(exc)))
