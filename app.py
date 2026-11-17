@@ -448,7 +448,7 @@ class AgendaApp:
         heading.pack(side="left", anchor="w")
         kicker = tk.Label(
             heading,
-            text="GLOBAL AGENDA",
+            text="GLOBAL AGENDA · 实验版",
             bg=BG,
             fg=MUTED,
             font=self.f_kicker,
@@ -844,11 +844,13 @@ class AgendaApp:
             yscrollincrement=self.px(20),
         )
         self.task_canvas.pack(fill="x", padx=self.px(8), pady=self.px(4))
-        self.task_inner = tk.Frame(self.task_canvas, bg=BG)
-        self._task_window = self.task_canvas.create_window((0, 0), window=self.task_inner, anchor="nw")
-        self.task_inner.bind("<Configure>", self._on_task_inner_configure)
         self.task_canvas.bind("<Configure>", self._on_task_canvas_configure)
+        self.task_canvas.bind("<Motion>", self._on_task_canvas_motion)
+        self.task_canvas.bind("<Leave>", self._on_task_canvas_leave)
         self.root.bind("<MouseWheel>", self._on_mousewheel)
+        self._canvas_render_width = 0
+        self._hover_task_id: Optional[str] = None
+        self._row_rects: dict[str, int] = {}
 
         tk.Frame(self.main, bg=BORDER_SOFT, height=1).pack(fill="x", padx=self.px(13))
 
@@ -2163,22 +2165,11 @@ class AgendaApp:
     def _refresh_task_ui(self, *, scroll_top: bool = False) -> None:
         old_pos = self.task_canvas.yview()[0] if self.task_canvas.winfo_exists() else 0.0
         visible = self._visible_tasks()
-        rows_changed = self._sync_task_rows()
-        shown_changed = self._show_task_rows(visible)
-        if rows_changed or shown_changed:
-            self.task_inner.update_idletasks()
-            content_height = max(self.task_inner.winfo_reqheight(), 1)
-            work = work_area()
-            max_height = min(self.px(300), int((work[3] - work[1]) * 0.36))
-            target_height = min(max(content_height, self.px(46)), max_height)
-            self.task_canvas.configure(height=target_height)
-            self.task_canvas.configure(scrollregion=(0, 0, max(self.task_canvas.winfo_width(), 1), content_height))
-            if scroll_top:
-                self.task_canvas.yview_moveto(0.0)
-            else:
-                self.task_canvas.yview_moveto(old_pos)
-        elif scroll_top:
+        self._render_task_canvas(visible)
+        if scroll_top:
             self.task_canvas.yview_moveto(0.0)
+        else:
+            self.task_canvas.yview_moveto(old_pos)
         if self.search_open:
             query = self.search_query.strip()
             self.search_count.configure(text=f"{len(visible)} 项" if query else f"全部 {len(visible)} 项")
@@ -2186,6 +2177,266 @@ class AgendaApp:
         self._update_view_bar()
         self._update_footer()
         self._schedule_resize()
+
+    def _render_task_canvas(self, visible: list[dict]) -> None:
+        canvas = self.task_canvas
+        canvas.delete("all")
+        self._row_rects = {}
+        self._hover_task_id = None
+        width = max(canvas.winfo_width(), self.W - self.px(16), 1)
+        self._canvas_render_width = width
+        if not visible:
+            self._draw_empty_canvas(width)
+            return
+        y = 0
+        for task in visible:
+            y = self._draw_canvas_row(task, y, width)
+        total_height = max(y + self.px(2), self.px(1))
+        work = work_area()
+        max_height = min(self.px(300), int((work[3] - work[1]) * 0.36))
+        target_height = min(max(total_height, self.px(46)), max_height)
+        canvas.configure(scrollregion=(0, 0, width, total_height))
+        canvas.configure(height=target_height)
+
+    def _draw_canvas_row(self, task: dict, top: int, width: int) -> int:
+        canvas = self.task_canvas
+        task_id = task["id"]
+        done = bool(task.get("done"))
+        editing = task_id == self.editing_task_id
+        severity = self._severity_of(task)
+        severity_color = BORDER if done else SEVERITY_COLORS[severity]
+        due = self._task_date(task)
+        at = self._task_time(task)
+        overdue = due is not None and not done and due < date.today()
+        deadline = self._task_deadline(task)
+        if deadline is not None:
+            overdue = not done and deadline < datetime.now()
+        row_tag = f"row:{task_id}"
+        toggle_tag = f"toggle:{task_id}"
+        text_x = self.px(34)
+        text_y = top + self.px(6)
+        wrap = max(width - text_x - self.px(76), self.px(80))
+        rect = canvas.create_rectangle(
+            0,
+            top,
+            width,
+            top + self.px(44),
+            fill=BG,
+            outline="",
+            tags=("taskrow", row_tag, toggle_tag),
+        )
+        text = canvas.create_text(
+            text_x,
+            text_y,
+            text=task.get("text", ""),
+            anchor="nw",
+            width=wrap,
+            justify="left",
+            fill=DIM if done else TEXT,
+            font=self.f_task_done if done else self.f_task,
+            tags=("taskrow", row_tag, toggle_tag),
+        )
+        text_bbox = canvas.bbox(text) or (text_x, text_y, text_x + wrap, text_y + self.px(18))
+        meta_y = text_bbox[3] + self.px(4)
+        severity_text = f"{SEVERITY_LABELS[severity]} ▾"
+        severity_item = canvas.create_text(
+            text_x,
+            meta_y,
+            text=severity_text,
+            anchor="nw",
+            fill=DIM if done else severity_color,
+            font=self.f_tiny_bold,
+            tags=("taskrow", row_tag, f"priority:{task_id}"),
+        )
+        severity_bbox = canvas.bbox(severity_item) or (text_x, meta_y, text_x, meta_y + self.px(14))
+        separator_x = severity_bbox[2] + self.px(5)
+        separator = canvas.create_text(
+            separator_x,
+            meta_y,
+            text="·",
+            anchor="nw",
+            fill=DIM,
+            font=self.f_tiny,
+            tags=("taskrow", row_tag, toggle_tag),
+        )
+        separator_bbox = canvas.bbox(separator) or (separator_x, meta_y, separator_x, meta_y + self.px(14))
+        date_x = separator_bbox[2] + self.px(7)
+        date_item = canvas.create_text(
+            date_x,
+            meta_y,
+            text=self._due_text(due, done, at),
+            anchor="nw",
+            width=max(width - date_x - self.px(68), self.px(40)),
+            justify="left",
+            fill=DANGER if overdue else (DIM if done else MUTED),
+            font=self.f_tiny,
+            tags=("taskrow", row_tag, toggle_tag),
+        )
+        date_bbox = canvas.bbox(date_item) or (date_x, meta_y, date_x, meta_y + self.px(14))
+        row_height = max(date_bbox[3] - top + self.px(7), self.px(42))
+        canvas.coords(rect, 0, top, width, top + row_height)
+        canvas.create_rectangle(
+            0,
+            top + self.px(3),
+            self.px(3),
+            top + row_height - self.px(3),
+            fill=severity_color,
+            outline="",
+            tags=("taskrow", row_tag),
+        )
+        circle_x = self.px(17)
+        circle_y = top + self.px(14)
+        radius = self.px(8)
+        canvas.create_oval(
+            circle_x - radius,
+            circle_y - radius,
+            circle_x + radius,
+            circle_y + radius,
+            fill=ACCENT if done else BG,
+            outline=ACCENT if done else MUTED,
+            width=max(1, self.px(1)),
+            tags=("taskrow", row_tag, toggle_tag),
+        )
+        if done:
+            canvas.create_line(
+                circle_x - radius * 0.45,
+                circle_y,
+                circle_x - radius * 0.1,
+                circle_y + radius * 0.35,
+                circle_x + radius * 0.5,
+                circle_y - radius * 0.4,
+                fill=ON_ACCENT,
+                width=max(1, self.px(1.5)),
+                capstyle=tk.ROUND,
+                joinstyle=tk.ROUND,
+                tags=("taskrow", row_tag, toggle_tag),
+            )
+        canvas.create_text(
+            width - self.px(34),
+            top + self.px(8),
+            text="编辑",
+            anchor="ne",
+            fill=ACCENT if editing else DIM,
+            font=self.f_tiny,
+            tags=("taskrow", row_tag, f"edit:{task_id}"),
+        )
+        canvas.create_text(
+            width - self.px(6),
+            top + self.px(7),
+            text="×",
+            anchor="ne",
+            fill=DIM,
+            font=self.f_small,
+            tags=("taskrow", row_tag, f"delete:{task_id}"),
+        )
+        canvas.tag_bind(
+            toggle_tag,
+            "<Button-1>",
+            lambda _event, tid=task_id: self._toggle_task(tid),
+        )
+        canvas.tag_bind(
+            f"edit:{task_id}",
+            "<Button-1>",
+            lambda _event, tid=task_id: self._begin_edit(tid),
+        )
+        canvas.tag_bind(
+            f"delete:{task_id}",
+            "<Button-1>",
+            lambda _event, tid=task_id: self._delete_task(tid),
+        )
+        canvas.tag_bind(
+            f"priority:{task_id}",
+            "<Button-1>",
+            lambda event, tid=task_id: self._show_priority_menu(event, tid),
+        )
+        self._row_rects[task_id] = rect
+        return top + row_height
+
+    def _draw_empty_canvas(self, width: int) -> None:
+        canvas = self.task_canvas
+        query = self.search_query.strip()
+        if self.search_open:
+            title = "没有匹配的日程" if query else "还没有日程"
+            hint = "换个关键词，或点 × 退出搜索" if query else "在上方输入，按 Enter 添加"
+        elif self.selected_date:
+            title = f"{self._short_date(self.selected_date)}还没有日程"
+            hint = f"还有 {len(self.tasks)} 项其他日程，点“全部”查看" if self.tasks else "在上方输入，按 Enter 添加"
+        else:
+            title = "还没有日程"
+            hint = "在上方输入，按 Enter 添加"
+        center = width // 2
+        size = self.px(34)
+        top = self.px(12)
+        canvas.create_oval(
+            center - size / 2,
+            top,
+            center + size / 2,
+            top + size,
+            outline=BORDER,
+            width=max(1, self.px(1)),
+            dash=(2, 3),
+        )
+        canvas.create_line(
+            center,
+            top + size * 0.34,
+            center,
+            top + size * 0.66,
+            fill=MUTED,
+            width=max(1, self.px(1)),
+        )
+        canvas.create_line(
+            center - size * 0.16,
+            top + size * 0.5,
+            center + size * 0.16,
+            top + size * 0.5,
+            fill=MUTED,
+            width=max(1, self.px(1)),
+        )
+        canvas.create_text(
+            center,
+            top + size + self.px(10),
+            text=title,
+            fill=TEXT,
+            font=self.f_body_bold,
+            anchor="n",
+        )
+        canvas.create_text(
+            center,
+            top + size + self.px(30),
+            text=hint,
+            fill=MUTED,
+            font=self.f_tiny,
+            anchor="n",
+            width=max(width - self.px(20), self.px(100)),
+        )
+        total_height = top + size + self.px(58)
+        canvas.configure(scrollregion=(0, 0, width, total_height))
+        canvas.configure(height=min(total_height, self.px(120)))
+
+    def _on_task_canvas_motion(self, _event=None) -> None:
+        current = self.task_canvas.find_withtag("current")
+        tags = set(self.task_canvas.gettags(current[0])) if current else set()
+        row_id = next((tag[4:] for tag in tags if tag.startswith("row:")), None)
+        if row_id != self._hover_task_id:
+            if self._hover_task_id:
+                rect = self._row_rects.get(self._hover_task_id)
+                if rect is not None:
+                    self.task_canvas.itemconfigure(rect, fill=BG)
+            self._hover_task_id = row_id
+            if row_id:
+                rect = self._row_rects.get(row_id)
+                if rect is not None:
+                    self.task_canvas.itemconfigure(rect, fill=CARD_HOVER)
+        has_action = any(tag.startswith(("edit:", "delete:", "priority:")) for tag in tags)
+        self.task_canvas.configure(cursor="hand2" if (row_id or has_action) else "")
+
+    def _on_task_canvas_leave(self, _event=None) -> None:
+        if self._hover_task_id:
+            rect = self._row_rects.get(self._hover_task_id)
+            if rect is not None:
+                self.task_canvas.itemconfigure(rect, fill=BG)
+        self._hover_task_id = None
+        self.task_canvas.configure(cursor="")
 
     def _build_empty_state(self, *, filtered: bool = False, searching: bool = False) -> None:
         empty = tk.Frame(self.task_inner, bg=BG, pady=self.px(12))
@@ -2889,24 +3140,13 @@ class AgendaApp:
         finally:
             self.menu.grab_release()
 
-    def _on_task_inner_configure(self, _event=None) -> None:
-        width = max(self.task_canvas.winfo_width(), 1)
-        self.task_canvas.itemconfigure(self._task_window, width=width)
-        self.task_canvas.configure(scrollregion=self.task_canvas.bbox("all"))
-
     def _on_task_canvas_configure(self, event) -> None:
-        self.task_canvas.itemconfigure(self._task_window, width=max(event.width, 1))
+        if event.width > 0 and abs(event.width - self._canvas_render_width) > 1 and not self._closing:
+            self.root.after_idle(lambda: self._refresh_task_ui(scroll_top=False))
 
     def _on_mousewheel(self, event) -> str:
         widget = self.root.winfo_containing(self.root.winfo_pointerx(), self.root.winfo_pointery())
-        inside = False
-        current = widget
-        while current is not None:
-            if current is self.task_canvas or current is self.task_inner:
-                inside = True
-                break
-            current = current.master
-        if not inside:
+        if widget is not self.task_canvas:
             return "break"
         delta = -1 if event.delta > 0 else 1
         self.task_canvas.yview_scroll(delta, "units")
