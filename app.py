@@ -448,7 +448,7 @@ class AgendaApp:
         heading.pack(side="left", anchor="w")
         kicker = tk.Label(
             heading,
-            text="GLOBAL AGENDA · 实验版",
+            text="GLOBAL AGENDA",
             bg=BG,
             fg=MUTED,
             font=self.f_kicker,
